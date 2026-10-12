@@ -1,0 +1,24 @@
+# секреты
+.env
+*.env
+!.env.example
+
+# результаты прогонов
+experiment/results/*
+!experiment/results/.gitkeep
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# система и редакторы
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+~$*
+
+# личное, не для команды
+soobshchenie-v-chat.txt
