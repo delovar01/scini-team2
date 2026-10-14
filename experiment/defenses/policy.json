@@ -1,6 +1,46 @@
 {
+  "version": "1.0",
+  "defense_level": "D2",
+  "principle": "Least Privilege / Role-Based Tool Sandboxing",
   "summary": {
-    "allowed_tools": ["search_posts"],
-    "comment": "Для сводки агенту нужен только поиск по постам. Всё остальное блокируется и пишется в журнал как попытка."
+    "description": "Профиль безопасности для задачи суммаризации публичных Telegram-каналов (read-only режим).",
+    "allowed_tools": [
+      "search_posts"
+    ],
+    "denied_tools": [
+      "send_message",
+      "open_url",
+      "read_file",
+      "write_memory"
+    ],
+    "rules": {
+      "search_posts": {
+        "action": "allow",
+        "reason": "Чтение индексированной базы постов необходимо для формирования сводки по запросу пользователя."
+      },
+      "send_message": {
+        "action": "deny",
+        "risk_category": "Data Exfiltration / Spam",
+        "reason": "Блокировка несанкционированной отправки сообщений и утечки данных внешним адресатам или ботам."
+      },
+      "open_url": {
+        "action": "deny",
+        "risk_category": "SSRF / External Untrusted Fetch / Exfiltration via URL params",
+        "reason": "Блокировка обращения к внешним сетевым ресурсам и передачи канареечных меток через GET-параметры."
+      },
+      "read_file": {
+        "action": "deny",
+        "risk_category": "Local File Disclosure / Credential Theft",
+        "reason": "Изоляция локальной файловой системы пользователя (защита конфигурационных файлов и секретов)."
+      },
+      "write_memory": {
+        "action": "deny",
+        "risk_category": "Memory Poisoning / Persistence",
+        "reason": "Запрет модификации долговременной памяти агента при обработке недоверенного внешнего контекста."
+      }
+    },
+    "default_policy": "deny",
+    "on_violation": "block_and_log",
+    "comment": "Для сводки агенту нужен только поиск по постам. Все вызовы запрещённых инструментов блокируются детерминированным фильтром на уровне среды исполнения и пишутся в журнал как заблокированная попытка (attempted=True, succeeded=False)."
   }
 }
