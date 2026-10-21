@@ -13,7 +13,8 @@ RAG-агент делает сводку постов Telegram-каналов. �
 Запуск без ключей (офлайн-заглушка, проверка, что всё работает):
     python run.py --models dummy --limit 10
 
-Запуск на реальных моделях (ключи в .env, см. .env.example):
+Запуск на реальных моделях (ключи в .env, см. .env.example;
+адаптер — MODEL_N_KIND: openai или gigachat):
     python run.py --models 1,2,3 --defenses D0,D1,D2
 
 Только стандартная библиотека Python 3.10+.
@@ -29,8 +30,12 @@ import os
 import random
 import re
 import sys
+import ssl
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -275,39 +280,174 @@ class DummyModel:
         return "\n".join(calls + ["Сводка: в канале вышли посты по теме запроса."])
 
 
-class OpenAICompatModel:
-    """Любой сервис с OpenAI-совместимым /chat/completions."""
+def env_flag(name: str, default: bool = True) -> bool:
+    value = (os.environ.get(name) or "").strip().lower()
+    if not value:
+        return default
+    return value not in ("0", "false", "no", "off")
+
+
+def make_ssl_context(verify: bool = True, ca_file: str = "") -> ssl.SSLContext:
+    """По умолчанию — обычная проверка сертификата по системному хранилищу.
+
+    ca_file — путь к дополнительному корневому сертификату (у Сбера — НУЦ Минцифры),
+    добавляется к системным. verify=False отключает проверку совсем — только для пробы.
+    """
+    ctx = ssl.create_default_context()
+    if not verify:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    elif ca_file:
+        ctx.load_verify_locations(cafile=ca_file)
+    return ctx
+
+
+def post_json(url: str, data: bytes, headers: dict, timeout: int,
+              context: ssl.SSLContext | None = None) -> dict:
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout, context=context) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+class BaseAPIModel:
+    """Общее для реальных моделей: настройки из .env, пауза между запросами, повторы."""
+
+    retry_base = 5.0                 # пауза перед повтором: 5, затем 10 с
 
     def __init__(self, idx: str):
+        self.idx = idx
         self.name = os.environ.get(f"MODEL_{idx}_NAME", f"model-{idx}")
-        self.base_url = os.environ[f"MODEL_{idx}_BASE_URL"].rstrip("/")
         self.api_key = os.environ.get(f"MODEL_{idx}_API_KEY", "")
         self.model_id = os.environ[f"MODEL_{idx}_ID"]
         self.temperature = float(os.environ.get("TEMPERATURE", "0"))
         self.timeout = int(os.environ.get("REQUEST_TIMEOUT", "60"))
+        # бесплатные тарифы режут частоту (OpenRouter :free — 20 запросов в минуту)
+        self.min_interval = float(os.environ.get(f"MODEL_{idx}_MIN_INTERVAL") or 0)
+        self._last_call = 0.0
+
+    def _throttle(self) -> None:
+        wait = self._last_call + self.min_interval - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        self._last_call = time.monotonic()
+
+    def _complete(self, messages: list[dict]) -> str:
+        raise NotImplementedError
 
     def chat(self, messages: list[dict]) -> str:
-        body = json.dumps({"model": self.model_id, "messages": messages,
-                           "temperature": self.temperature}).encode("utf-8")
-        req = urllib.request.Request(f"{self.base_url}/chat/completions", data=body,
-                                     headers={"Content-Type": "application/json",
-                                              "Authorization": f"Bearer {self.api_key}"})
         for attempt in range(3):
             try:
-                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
-                return data["choices"][0]["message"]["content"] or ""
+                self._throttle()
+                return self._complete(messages)
             except Exception as e:                    # сеть, лимиты — повтор с паузой
                 if attempt == 2:
                     return f"[ERROR] {e}"
-                time.sleep(2 ** attempt * 5)
+                time.sleep(2 ** attempt * self.retry_base)
         return ""
+
+
+class OpenAICompatModel(BaseAPIModel):
+    """Любой сервис с OpenAI-совместимым /chat/completions (OpenRouter, Yandex AI Studio, Ollama).
+
+    MODEL_N_AUTH_SCHEME — Bearer (по умолчанию) или Api-Key;
+    MODEL_N_PROJECT     — заголовок OpenAI-Project (у Yandex AI Studio — id каталога).
+    """
+
+    def __init__(self, idx: str):
+        super().__init__(idx)
+        self.base_url = os.environ[f"MODEL_{idx}_BASE_URL"].rstrip("/")
+        self.auth_scheme = os.environ.get(f"MODEL_{idx}_AUTH_SCHEME") or "Bearer"
+        self.project = os.environ.get(f"MODEL_{idx}_PROJECT", "")
+
+    def _complete(self, messages: list[dict]) -> str:
+        body = json.dumps({"model": self.model_id, "messages": messages,
+                           "temperature": self.temperature}).encode("utf-8")
+        headers = {"Content-Type": "application/json",
+                   "Authorization": f"{self.auth_scheme} {self.api_key}"}
+        if self.project:
+            headers["OpenAI-Project"] = self.project
+        data = post_json(f"{self.base_url}/chat/completions", body, headers, self.timeout)
+        return data["choices"][0]["message"]["content"] or ""
+
+
+class GigaChatModel(BaseAPIModel):
+    """GigaChat API Сбера.
+
+    MODEL_N_API_KEY — ключ авторизации из личного кабинета (Base64 от Client ID:Client Secret).
+    По нему берётся токен доступа: живёт 30 минут, кэшируется и обновляется сам.
+    Сертификат у Сбера от НУЦ Минцифры: GIGACHAT_CA_BUNDLE — путь к нему,
+    GIGACHAT_VERIFY_SSL=0 — отключить проверку (только для пробы).
+    """
+
+    TOKEN_TTL = 30 * 60
+    TOKEN_MARGIN = 60                # обновляем токен за минуту до конца срока
+
+    def __init__(self, idx: str):
+        super().__init__(idx)
+        if not self.api_key:
+            raise SystemExit(f"MODEL_{idx}_API_KEY пуст: нужен ключ авторизации GigaChat")
+        self.base_url = (os.environ.get(f"MODEL_{idx}_BASE_URL")
+                         or "https://api.giga.chat/v1").rstrip("/")
+        self.auth_url = (os.environ.get("GIGACHAT_AUTH_URL")
+                         or "https://ngw.devices.sberbank.ru:9443/api/v2/oauth")
+        self.scope = os.environ.get("GIGACHAT_SCOPE") or "GIGACHAT_API_PERS"
+        self.ssl_context = make_ssl_context(env_flag("GIGACHAT_VERIFY_SSL", True),
+                                            os.environ.get("GIGACHAT_CA_BUNDLE", ""))
+        self._token = ""
+        self._token_until = 0.0
+
+    def _get_token(self) -> str:
+        if self._token and time.time() < self._token_until - self.TOKEN_MARGIN:
+            return self._token
+        data = post_json(
+            self.auth_url,
+            urllib.parse.urlencode({"scope": self.scope}).encode("ascii"),
+            {"Content-Type": "application/x-www-form-urlencoded",
+             "Accept": "application/json",
+             "RqUID": str(uuid.uuid4()),
+             "Authorization": f"Basic {self.api_key}"},
+            self.timeout, self.ssl_context)
+        until = time.time() + self.TOKEN_TTL
+        if data.get("expires_at"):
+            expires_at = float(data["expires_at"])
+            if expires_at > 1e12:                     # пришло в миллисекундах
+                expires_at /= 1000
+            until = min(until, expires_at)
+        self._token, self._token_until = data["access_token"], until
+        return self._token
+
+    def _complete(self, messages: list[dict]) -> str:
+        body = json.dumps({"model": self.model_id, "messages": messages,
+                           "temperature": self.temperature}).encode("utf-8")
+        for retry in (False, True):
+            if retry:
+                self._token = ""                      # 401 — токен отозван раньше срока
+            headers = {"Content-Type": "application/json", "Accept": "application/json",
+                       "Authorization": f"Bearer {self._get_token()}"}
+            try:
+                data = post_json(f"{self.base_url}/chat/completions", body, headers,
+                                 self.timeout, self.ssl_context)
+                return data["choices"][0]["message"]["content"] or ""
+            except urllib.error.HTTPError as e:
+                if e.code != 401 or retry:
+                    raise
+        return ""
+
+
+MODEL_KINDS = {"openai": OpenAICompatModel, "gigachat": GigaChatModel}
+
+
+def make_model(idx: str):
+    kind = (os.environ.get(f"MODEL_{idx}_KIND") or "openai").strip().lower()
+    if kind not in MODEL_KINDS:
+        raise SystemExit(f"MODEL_{idx}_KIND={kind}: допустимо {', '.join(MODEL_KINDS)}")
+    return MODEL_KINDS[kind](idx)
 
 
 def make_models(spec: str):
     if spec == "dummy":
         return [DummyModel()]
-    return [OpenAICompatModel(idx.strip()) for idx in spec.split(",")]
+    return [make_model(idx.strip()) for idx in spec.split(",")]
 
 
 # ---------------------------------------------------------------- 6. оценка
