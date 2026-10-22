@@ -155,22 +155,36 @@ def build_samples(posts: list[Post], attacks: list[Attack], positions: list[str]
 # ---------------------------------------------------------------- 2. RAG
 
 class Retriever:
-    """Семантический Retriever на multilingual-e5-small.
+    """Семантический Retriever на multilingual-e5-small с document chunking.
 
-    Базовый корпус кодируется один раз при создании Retriever. Для конкретного
-    экспериментального sample можно временно подменить ровно один документ через
-    override=(post_id, poisoned_text), не изменяя базовое состояние Retriever.
+    Базовый корпус разбивается на перекрывающиеся token-chunks и кодируется один
+    раз при создании Retriever. Релевантность документа определяется максимальной
+    cosine similarity среди его chunks.
 
-    Возвращаемый контракт сохраняется:
-        search(query, k) -> list[(post_id, text)]
-    Параметр override необязателен и нужен только экспериментальному стенду.
+    Для конкретного экспериментального sample можно временно подменить ровно один
+    документ через override=(post_id, poisoned_text), не изменяя базовое состояние.
+
+    Возвращаемый контракт:
+        search(query, k) -> list[(post_id, full_text)]
     """
 
     DEFAULT_MODEL = "intfloat/multilingual-e5-small"
+    DEFAULT_CHUNK_TOKENS = 400
+    DEFAULT_CHUNK_OVERLAP = 50
 
-    def __init__(self, docs: dict[str, str], model_name: str | None = None):
+    def __init__(
+        self,
+        docs: dict[str, str],
+        model_name: str | None = None,
+        chunk_tokens: int = DEFAULT_CHUNK_TOKENS,
+        chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
+    ):
         if not docs:
             raise ValueError("Retriever требует непустой корпус документов")
+        if chunk_tokens <= 0:
+            raise ValueError("chunk_tokens должен быть > 0")
+        if chunk_overlap < 0 or chunk_overlap >= chunk_tokens:
+            raise ValueError("chunk_overlap должен быть >= 0 и < chunk_tokens")
 
         self.docs = dict(docs)
         self.doc_ids = list(self.docs)
@@ -180,10 +194,40 @@ class Retriever:
         print(f"загрузка embedding-модели: {self.model_name}")
         self.model = SentenceTransformer(self.model_name)
 
-        passages = [f"passage: {self.docs[post_id]}" for post_id in self.doc_ids]
-        print(f"кодирование базового корпуса: {len(passages)} постов")
+        # Оставляем запас под префикс "passage:" и специальные токены модели.
+        max_content_tokens = int(self.model.max_seq_length) - 16
+        if chunk_tokens > max_content_tokens:
+            raise ValueError(
+                f"chunk_tokens={chunk_tokens} слишком велик для модели "
+                f"с max_seq_length={self.model.max_seq_length}; "
+                f"используй <= {max_content_tokens}"
+            )
+
+        self.chunk_tokens = chunk_tokens
+        self.chunk_overlap = chunk_overlap
+
+        # Для каждого chunk храним индекс исходного post_id.
+        base_chunks: list[str] = []
+        chunk_doc_indices: list[int] = []
+        self.chunks_per_doc: dict[str, int] = {}
+
+        for post_id in self.doc_ids:
+            chunks = self._chunk_text(self.docs[post_id])
+            self.chunks_per_doc[post_id] = len(chunks)
+            doc_index = self.id_to_index[post_id]
+            for chunk in chunks:
+                base_chunks.append(f"passage: {chunk}")
+                chunk_doc_indices.append(doc_index)
+
+        self.chunk_doc_indices = np.asarray(chunk_doc_indices, dtype=np.int32)
+
+        print(
+            f"кодирование базового корпуса: {len(self.doc_ids)} постов "
+            f"-> {len(base_chunks)} чанков "
+            f"(chunk={self.chunk_tokens}, overlap={self.chunk_overlap})"
+        )
         self.base_embeddings = self.model.encode(
-            passages,
+            base_chunks,
             batch_size=32,
             show_progress_bar=False,
             convert_to_numpy=True,
@@ -194,6 +238,29 @@ class Retriever:
         # (модели × защиты), поэтому повторно их не кодируем.
         self.query_cache: dict[str, np.ndarray] = {}
         self.passage_cache: dict[str, np.ndarray] = {}
+
+    def _chunk_text(self, text: str) -> list[str]:
+        """Разбивает документ на token-chunks с overlap без обрезания хвоста."""
+        token_ids = self.model.tokenizer.encode(text, add_special_tokens=False)
+        if not token_ids:
+            return [""]
+
+        step = self.chunk_tokens - self.chunk_overlap
+        chunks: list[str] = []
+        for start in range(0, len(token_ids), step):
+            piece = token_ids[start:start + self.chunk_tokens]
+            if not piece:
+                break
+            chunks.append(
+                self.model.tokenizer.decode(
+                    piece,
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False,
+                )
+            )
+            if start + self.chunk_tokens >= len(token_ids):
+                break
+        return chunks
 
     def _encode_query(self, query: str) -> np.ndarray:
         cached = self.query_cache.get(query)
@@ -209,32 +276,47 @@ class Retriever:
         self.query_cache[query] = embedding
         return embedding
 
-    def _encode_passage(self, text: str) -> np.ndarray:
+    def _encode_passage_chunks(self, text: str) -> np.ndarray:
+        """Кодирует все chunks одного документа; результат кэшируется по полному тексту."""
         cached = self.passage_cache.get(text)
         if cached is not None:
             return cached
 
-        embedding = self.model.encode(
-            f"passage: {text}",
+        chunks = [f"passage: {chunk}" for chunk in self._chunk_text(text)]
+        embeddings = self.model.encode(
+            chunks,
+            batch_size=32,
             show_progress_bar=False,
             convert_to_numpy=True,
             normalize_embeddings=True,
         )
-        self.passage_cache[text] = embedding
-        return embedding
+        self.passage_cache[text] = embeddings
+        return embeddings
 
-    def search(self, query: str, k: int,
-               override: tuple[str, str] | None = None) -> list[tuple[str, str]]:
-        """Возвращает top-k документов по exact cosine similarity.
+    def _document_scores(self, query_embedding: np.ndarray) -> np.ndarray:
+        """Агрегирует chunk-level similarities в document-level score через max."""
+        chunk_scores = self.base_embeddings @ query_embedding
+        doc_scores = np.full(len(self.doc_ids), -np.inf, dtype=np.float32)
+        np.maximum.at(doc_scores, self.chunk_doc_indices, chunk_scores)
+        return doc_scores
 
-        Поскольку embeddings нормализованы, cosine similarity равна dot product.
-        override временно заменяет один документ только для текущего поиска.
+    def search(
+        self,
+        query: str,
+        k: int,
+        override: tuple[str, str] | None = None,
+    ) -> list[tuple[str, str]]:
+        """Возвращает top-k документов по exact semantic similarity.
+
+        Поиск выполняется по всем chunk embeddings. Score документа — максимум
+        similarity среди его chunks. override временно заменяет один документ
+        только для текущего поиска; базовый корпус и base_embeddings не меняются.
         """
         if k <= 0:
             return []
 
         query_embedding = self._encode_query(query)
-        scores = self.base_embeddings @ query_embedding
+        scores = self._document_scores(query_embedding)
         actual_texts: dict[str, str] | None = None
 
         if override is not None:
@@ -242,25 +324,30 @@ class Retriever:
             if post_id not in self.id_to_index:
                 raise KeyError(f"Неизвестный post_id для override: {post_id}")
 
-            # Копируем только массив scores; базовые embeddings не меняются.
             scores = scores.copy()
             index = self.id_to_index[post_id]
-            scores[index] = float(self._encode_passage(text) @ query_embedding)
+
+            override_embeddings = self._encode_passage_chunks(text)
+            override_scores = override_embeddings @ query_embedding
+            scores[index] = float(np.max(override_scores))
+
             actual_texts = {post_id: text}
 
         top_k = min(k, len(self.doc_ids))
-        # Полная стабильная сортировка для маленького корпуса (250 документов)
-        # проще и воспроизводимее приблизительного ANN-поиска.
+        # Сортируем уже document-level scores, поэтому один пост не может занять
+        # несколько мест в top-k даже если релевантны несколько его chunks.
         indices = np.argsort(-scores, kind="stable")[:top_k]
 
         result = []
         for index in indices:
             post_id = self.doc_ids[int(index)]
-            text = actual_texts.get(post_id, self.docs[post_id]) if actual_texts else self.docs[post_id]
+            text = (
+                actual_texts.get(post_id, self.docs[post_id])
+                if actual_texts
+                else self.docs[post_id]
+            )
             result.append((post_id, text))
         return result
-
-
 # ---------------------------------------------------------------- 3. инструменты
 
 TOOLS = {
@@ -673,6 +760,12 @@ def main() -> None:
     retriever = Retriever(
         base_docs,
         model_name=os.environ.get("EMBEDDING_MODEL", Retriever.DEFAULT_MODEL),
+        chunk_tokens=int(os.environ.get(
+            "EMBEDDING_CHUNK_TOKENS", str(Retriever.DEFAULT_CHUNK_TOKENS)
+        )),
+        chunk_overlap=int(os.environ.get(
+            "EMBEDDING_CHUNK_OVERLAP", str(Retriever.DEFAULT_CHUNK_OVERLAP)
+        )),
     )
     print(f"постов {len(posts)}, атак {len(attacks)}, примеров {len(samples)}, "
           f"моделей {len(models)}, защит {len(defenses)}")
