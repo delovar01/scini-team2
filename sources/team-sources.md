@@ -19,15 +19,23 @@
 
 ## Алексей — атаки на RAG
 
-1. Zou W. et al. PoisonedRAG — уже есть в bib как [zou2024poisonedrag]
-2. Practical Poisoning Attacks against Retrieval-Augmented Generation (CorruptRAG). https://doi.org/10.1145/3750555.3811900
-3. BadRAG: Identifying Vulnerabilities in Retrieval Augmented Generation of Large Language Models. https://arxiv.org/abs/2406.00083
-4. HijackRAG: Hijacking Attacks against Retrieval-Augmented Large Language Models. https://arxiv.org/abs/2410.22832
-5. Human-Imperceptible Retrieval Poisoning Attacks in LLM-Powered Applications. https://doi.org/10.1145/3663529.3663786
-6. Tricking Retrievers with Influential Tokens: An Efficient Black-box Corpus Poisoning Attack // NAACL 2025. https://aclanthology.org/2025.naacl-long.210/
-7. Machine Against the RAG: Jamming Retrieval-Augmented Generation with Blocker Documents // USENIX Security 2025. https://www.usenix.org/system/files/usenixsecurity25-shafran.pdf
-8. The Hidden Threat in Plain Text: Attacking RAG Data Loaders (PhantomText Toolkit). https://doi.org/10.1145/3733799.3762976
-9. Safeguarding RAG Pipelines with GMTP: A Gradient-based Masked Token Probability Method for Poisoned Document Detection — дописать выходные данные
+1. Zou W., Geng R., Wang B., Jia J. **PoisonedRAG: Knowledge Corruption Attacks to Retrieval-Augmented Generation of Large Language Models** // USENIX Security 2025. Уже есть в `references.bib` как `[zou2024poisonedrag]`.
+
+2. Zhang B., Chen Y., Liu Z., Nie L., Li T., Liu Z., Fang M. **Practical Poisoning Attacks against Retrieval-Augmented Generation (CorruptRAG)** // Proceedings of the 31st ACM Symposium on Access Control Models and Technologies (SACMAT 2026). 2026. P. 33–44. DOI: `10.1145/3750555.3811900`. Ключ в `references.bib`: `[zhang2026practical]`.
+
+3. Xue J., Zheng M., Hu Y., Liu F., Chen X., Lou Q. **BadRAG: Identifying Vulnerabilities in Retrieval Augmented Generation of Large Language Models**. 2024. arXiv:`2406.00083`. Ключ в `references.bib`: `[xue2024badrag]`.
+
+4. Zhang Y., Li Q., Du T., Zhang X., Zhao X., Feng Z., Yin J. **HijackRAG: Hijacking Attacks against Retrieval-Augmented Large Language Models**. 2024. arXiv:`2410.22832`. Ключ в `references.bib`: `[zhang2024hijackrag]`.
+
+5. Zhang Q., Zeng B., Zhou C., Go G., Shi H., Jiang Y. **Human-Imperceptible Retrieval Poisoning Attacks in LLM-Powered Applications** // Companion Proceedings of the 32nd ACM International Conference on the Foundations of Software Engineering (FSE 2024). 2024. P. 502–506. DOI: `10.1145/3663529.3663786`. Ключ в `references.bib`: `[zhang2024human]`.
+
+6. **Tricking Retrievers with Influential Tokens: An Efficient Black-box Corpus Poisoning Attack** // NAACL 2025. Источник оставлен для дополнительного анализа retrieval-stage атак; полные выходные данные добавить отдельно перед использованием в тексте.
+
+7. Shafran A., Schuster R., Shmatikov V. **Machine Against the RAG: Jamming Retrieval-Augmented Generation with Blocker Documents** // 34th USENIX Security Symposium (USENIX Security 25). 2025. P. 3787–3806. Ключ в `references.bib`: `[shafran2025machine]`.
+
+8. Castagnaro A., Salviati U., Conti M., Pajola L., Pizzi S. **The Hidden Threat in Plain Text: Attacking RAG Data Loaders** // Proceedings of the 18th ACM Workshop on Artificial Intelligence and Security (AISec 2025). 2025. P. 170–181. DOI: `10.1145/3733799.3762976`. Ключ в `references.bib`: `[castagnaro2025hidden]`.
+
+9. **Safeguarding RAG Pipelines with GMTP: A Gradient-based Masked Token Probability Method for Poisoned Document Detection** — источник для раздела о защитах; полные выходные данные дописать перед использованием.
 
 ## Азат — защиты и уязвимый код
 
