@@ -6,6 +6,8 @@
 # результаты прогонов
 experiment/results/*
 !experiment/results/.gitkeep
+experiment/results/*.jsonl
+experiment/results/*.csv
 
 # python
 __pycache__/
@@ -23,3 +25,4 @@ Thumbs.db
 # личное, не для команды
 soobshchenie-v-chat.txt
 experiment/certs/
+
